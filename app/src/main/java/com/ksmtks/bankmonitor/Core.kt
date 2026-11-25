@@ -124,6 +124,22 @@ class Prefs(ctx: Context) {
     var monthly: Boolean
         get() = b("monthly", true)
         set(v) = sp.edit().putBoolean("monthly", v).apply()
+    // 발송 시각: 하루 중 분 단위 (기본 00:10). 요일은 java.time.DayOfWeek 값(월=1..일=7)
+    var dailyMin: Int
+        get() = sp.getInt("dailyMin", 10)
+        set(v) = sp.edit().putInt("dailyMin", v).apply()
+    var weeklyMin: Int
+        get() = sp.getInt("weeklyMin", 10)
+        set(v) = sp.edit().putInt("weeklyMin", v).apply()
+    var weeklyDow: Int
+        get() = sp.getInt("weeklyDow", 1)
+        set(v) = sp.edit().putInt("weeklyDow", v).apply()
+    var monthlyMin: Int
+        get() = sp.getInt("monthlyMin", 10)
+        set(v) = sp.edit().putInt("monthlyMin", v).apply()
+    var monthlyDay: Int
+        get() = sp.getInt("monthlyDay", 1)
+        set(v) = sp.edit().putInt("monthlyDay", v).apply()
     var lastDaily: String
         get() = s("lastDaily")
         set(v) = sp.edit().putString("lastDaily", v).apply()
