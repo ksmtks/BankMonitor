@@ -21,6 +21,13 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".DayActivity"
+            android:exported="false" />
+        <activity
+            android:name=".DetailActivity"
+            android:exported="false" />
+
         <service
             android:name=".BankNotificationService"
             android:exported="true"

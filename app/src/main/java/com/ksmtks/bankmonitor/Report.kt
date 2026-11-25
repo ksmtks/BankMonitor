@@ -47,48 +47,61 @@ object Report {
         val end = if (upTo != null && upTo.plusDays(1).isBefore(periodEnd)) upTo.plusDays(1) else periodEnd
         val list = Db.get(ctx).between(Fmt.millis(start), Fmt.millis(end))
         val sb = StringBuilder()
-        sb.append("📊 ${p.label} 입금 요약\n${title(p, start, upTo)}\n\n")
+        sb.append("📊 ${p.label} 요약\n${title(p, start, upTo)}\n\n")
         if (list.isEmpty()) {
-            sb.append("입금 내역이 없습니다.")
+            sb.append("거래 내역이 없습니다.")
             return sb.toString()
         }
-        val total = list.sumOf { it.amount }
-        sb.append("총 입금: ${Fmt.won(total)} (${list.size}건)\n")
-        if (p != Period.DAY) {
-            val days = list.map { Fmt.day(it.ts) }.toSet().size
-            sb.append("입금 발생일: ${days}일 / 건당 평균 ${Fmt.won(total / list.size)}\n")
-        }
+        val t = Totals(list)
+        sb.append("입금  ${Fmt.won(t.dSum)} (${t.deposits.size}건)\n")
+        sb.append("출금  ${Fmt.won(t.wSum)} (${t.withdrawals.size}건)\n")
+        sb.append("순증감  ${Fmt.signed(t.net)}\n")
 
-        sb.append("\n[보낸 사람별]\n")
-        list.groupBy { it.sender }.entries
-            .sortedByDescending { e -> e.value.sumOf { it.amount } }
-            .take(10)
-            .forEach { e -> sb.append("· ${e.key}  ${Fmt.won(e.value.sumOf { it.amount })} (${e.value.size}건)\n") }
+        fun byParty(title: String, items: List<Txn>) {
+            if (items.isEmpty()) return
+            sb.append("\n[$title]\n")
+            items.groupBy { it.party }.entries
+                .sortedByDescending { e -> e.value.sumOf { it.amount } }
+                .take(10)
+                .forEach { e -> sb.append("· ${e.key}  ${Fmt.won(e.value.sumOf { it.amount })} (${e.value.size}건)\n") }
+        }
+        byParty("입금 - 보낸 사람별", t.deposits)
+        byParty("출금 - 받는 사람별", t.withdrawals)
 
         if (p == Period.DAY) {
-            sb.append("\n[입금 내역]\n")
-            list.sortedBy { it.ts }.forEach { sb.append("· ${Fmt.time(it.ts)}  ${it.sender}  ${Fmt.won(it.amount)}\n") }
+            sb.append("\n[거래 내역]\n")
+            list.sortedBy { it.ts }.forEach {
+                sb.append("· ${Fmt.time(it.ts)}  ${if (it.isDeposit) "입금" else "출금"}  ${it.party}  ${Fmt.amount(it)}\n")
+            }
         } else {
             sb.append("\n[일별]\n")
             list.groupBy { Fmt.day(it.ts) }.toSortedMap().forEach { (d, ds) ->
-                sb.append("· ${Fmt.dayShort(d)}  ${Fmt.won(ds.sumOf { it.amount })} (${ds.size}건)\n")
+                val dt = Totals(ds)
+                sb.append("· ${Fmt.dayShort(d)}  입금 ${Fmt.won(dt.dSum)} / 출금 ${Fmt.won(dt.wSum)}\n")
             }
         }
         val bal = list.firstOrNull { it.balance >= 0 }?.balance
-        if (bal != null) sb.append("\n마지막 입금 시점 잔액: ${Fmt.won(bal)}")
+        if (bal != null) sb.append("\n마지막 거래 시점 잔액: ${Fmt.won(bal)}")
         return sb.toString().trimEnd()
     }
 }
 
 /**
- * 보고서 발송 스케줄.
- * - 일간: 매일 지정 시각 / 주간: 지정 요일+시각 / 월간: 지정 일자+시각
- * - 집계 기준일: 발송 시각이 낮 12시 이후면 당일, 이전이면 전날까지.
+ * 보고서 발송 스케줄. 집계는 항상 발송일 당일 기준:
+ * 일간=발송일, 주간=발송일이 속한 주(월~발송일), 월간=발송일이 속한 달(1일~발송일).
+ * 일간: 매일 지정 시각 / 주간: 지정 요일+시각 / 월간: 지정 일자(0=말일)+시각
  */
 object Scheduler {
+    private const val SCHED_VER = 2
     private val zone: ZoneId get() = ZoneId.systemDefault()
 
     private fun at(d: LocalDate, min: Int): ZonedDateTime = d.atTime(min / 60, min % 60).atZone(zone)
+
+    private fun monthDay(anyDayInMonth: LocalDate, pf: Prefs): LocalDate {
+        val len = anyDayInMonth.lengthOfMonth()
+        val day = if (pf.monthlyDay <= 0) len else minOf(pf.monthlyDay, len)
+        return anyDayInMonth.withDayOfMonth(day)
+    }
 
     fun lastFire(pf: Prefs, p: Period, now: ZonedDateTime): ZonedDateTime = when (p) {
         Period.DAY -> {
@@ -103,19 +116,16 @@ object Scheduler {
         }
         Period.MONTH -> {
             val d = now.toLocalDate()
-            val t = at(d.withDayOfMonth(pf.monthlyDay), pf.monthlyMin)
-            if (t.isAfter(now)) at(d.withDayOfMonth(1).minusMonths(1).withDayOfMonth(pf.monthlyDay), pf.monthlyMin) else t
+            val t = at(monthDay(d, pf), pf.monthlyMin)
+            if (t.isAfter(now)) at(monthDay(d.withDayOfMonth(1).minusMonths(1), pf), pf.monthlyMin) else t
         }
     }
 
     private fun nextFire(pf: Prefs, p: Period, last: ZonedDateTime): ZonedDateTime = when (p) {
         Period.DAY -> at(last.toLocalDate().plusDays(1), pf.dailyMin)
         Period.WEEK -> at(last.toLocalDate().plusWeeks(1), pf.weeklyMin)
-        Period.MONTH -> at(last.toLocalDate().withDayOfMonth(1).plusMonths(1).withDayOfMonth(pf.monthlyDay), pf.monthlyMin)
+        Period.MONTH -> at(monthDay(last.toLocalDate().withDayOfMonth(1).plusMonths(1), pf), pf.monthlyMin)
     }
-
-    private fun effectiveDay(fire: ZonedDateTime): LocalDate =
-        if (fire.hour >= 12) fire.toLocalDate() else fire.toLocalDate().minusDays(1)
 
     private fun enabled(pf: Prefs, p: Period) = when (p) {
         Period.DAY -> pf.daily
@@ -144,6 +154,7 @@ object Scheduler {
         val pf = Prefs(ctx)
         val now = ZonedDateTime.now(zone)
         Period.values().forEach { setKey(pf, it, keyOf(lastFire(pf, it, now))) }
+        pf.schedVer = SCHED_VER
     }
 
     fun schedule(ctx: Context, retry: Boolean = false) {
@@ -186,6 +197,10 @@ object Scheduler {
     fun runDue(ctx: Context): Boolean {
         val pf = Prefs(ctx)
         if (!pf.configured) return true
+        if (pf.schedVer != SCHED_VER) { // 앱 업데이트로 스케줄 방식이 바뀐 경우: 과거분은 보내지 않고 기준만 갱신
+            resetKeys(ctx)
+            return true
+        }
         val now = ZonedDateTime.now(zone)
         var ok = true
         for (p in Period.values()) {
@@ -193,13 +208,13 @@ object Scheduler {
             val key = keyOf(fire)
             val last = lastKey(pf, p)
             if (last == key) continue
-            if (last.toLongOrNull() == null) { // 최초 실행(또는 이전 버전 형식): 보내지 않고 기준만 기록
+            if (last.toLongOrNull() == null) { // 최초 실행: 보내지 않고 기준만 기록
                 setKey(pf, p, key)
                 continue
             }
             if (enabled(pf, p)) {
-                val eff = effectiveDay(fire)
-                val text = Report.build(ctx, p, Report.startOf(p, eff), eff)
+                val day = fire.toLocalDate()
+                val text = Report.build(ctx, p, Report.startOf(p, day), day)
                 val (sent, _) = Telegram.send(pf.token, pf.chatId, text)
                 if (!sent) { ok = false; continue }
             }

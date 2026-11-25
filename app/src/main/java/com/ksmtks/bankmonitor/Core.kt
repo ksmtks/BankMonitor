@@ -14,78 +14,122 @@ import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import java.util.Locale
 
-data class Deposit(
+/** 거래 1건. kind: "D"=입금, "W"=출금. party=입금이면 보낸 사람, 출금이면 받는 사람. */
+data class Txn(
     val id: Long,
     val ts: Long,
+    val kind: String,
     val amount: Long,
-    val sender: String,
+    val party: String,
     val account: String,
-    val balance: Long // -1 = unknown
+    val balance: Long, // -1 = unknown
+    val raw: String
+) {
+    val isDeposit: Boolean get() = kind == "D"
+}
+
+class Totals(list: List<Txn>) {
+    val deposits: List<Txn> = list.filter { it.isDeposit }
+    val withdrawals: List<Txn> = list.filter { !it.isDeposit }
+    val dSum: Long = deposits.sumOf { it.amount }
+    val wSum: Long = withdrawals.sumOf { it.amount }
+    val net: Long get() = dSum - wSum
+}
+
+data class Parsed(
+    val kind: String, val amount: Long, val party: String,
+    val account: String, val balance: Long, val raw: String
 )
 
-data class Parsed(val amount: Long, val sender: String, val account: String, val balance: Long)
-
-/** 카카오뱅크 입금 알림 파서.
+/** 카카오뱅크 입출금 알림 파서.
  *  예) 제목 "입금 1원" / 본문 "김산 → 입출금통장(9540) 잔액 692,801원" */
 object Parser {
-    private val amountRe = Regex("""입금\s*([\d,]+)\s*원""")
-    private val routeRe = Regex("""([^\n→]+?)\s*→\s*([^\n(]+?)\s*\((\d+)\)""")
+    private val amountRe = Regex("""(입금|출금)\s*([\d,]+)\s*원""")
     private val balanceRe = Regex("""잔액\s*([\d,]+)\s*원""")
+    private val acctRe = Regex("""\(\d+\)""")
 
     private fun num(s: String): Long = s.replace(",", "").toLongOrNull() ?: 0L
 
     fun parse(title: String, text: String): Parsed? {
         val all = "$title\n$text"
-        val am = amountRe.find(all) ?: return null
-        val amount = num(am.groupValues[1])
+        val m = amountRe.find(title) ?: amountRe.find(all) ?: return null
+        val kind = if (m.groupValues[1] == "입금") "D" else "W"
+        val amount = num(m.groupValues[2])
         if (amount <= 0) return null
-        val route = routeRe.find(text) ?: routeRe.find(all)
-        val sender = route?.groupValues?.get(1)?.trim().orEmpty().ifEmpty { "알 수 없음" }
-        val account = if (route != null) "${route.groupValues[2].trim()}(${route.groupValues[3]})" else ""
         val balance = balanceRe.find(all)?.let { num(it.groupValues[1]) } ?: -1L
-        return Parsed(amount, sender, account, balance)
+
+        val clean = balanceRe.replace(text, "").trim()
+        var party = ""
+        var account = ""
+        val arrow = clean.indexOf('→')
+        if (arrow >= 0) {
+            val left = clean.substring(0, arrow).lines().lastOrNull().orEmpty().trim()
+            val right = clean.substring(arrow + 1).lines().firstOrNull().orEmpty().trim()
+            val leftAcct = acctRe.containsMatchIn(left)
+            val rightAcct = acctRe.containsMatchIn(right)
+            if (leftAcct && !rightAcct) { party = right; account = left } else { party = left; account = right }
+        } else {
+            party = clean.lines().firstOrNull { it.isNotBlank() && !amountRe.containsMatchIn(it) }?.trim().orEmpty()
+        }
+        if (party.isEmpty()) party = "알 수 없음"
+        return Parsed(kind, amount, party, account, balance, all.trim())
     }
 }
 
-class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "bank.db", null, 1) {
+class Db private constructor(ctx: Context) : SQLiteOpenHelper(ctx, "bank.db", null, 2) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL(
             "CREATE TABLE deposits(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, " +
-                "amount INTEGER NOT NULL, sender TEXT NOT NULL, account TEXT NOT NULL, balance INTEGER NOT NULL)"
+                "amount INTEGER NOT NULL, sender TEXT NOT NULL, account TEXT NOT NULL, balance INTEGER NOT NULL, " +
+                "kind TEXT NOT NULL DEFAULT 'D', raw TEXT NOT NULL DEFAULT '')"
         )
         db.execSQL("CREATE INDEX idx_ts ON deposits(ts)")
     }
 
-    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {}
+    override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+        if (oldVersion < 2) {
+            db.execSQL("ALTER TABLE deposits ADD COLUMN kind TEXT NOT NULL DEFAULT 'D'")
+            db.execSQL("ALTER TABLE deposits ADD COLUMN raw TEXT NOT NULL DEFAULT ''")
+        }
+    }
 
-    /** 같은 알림이 갱신되어 다시 올 때를 대비해 (금액, 보낸사람, 잔액)이 같고 2분 이내면 중복으로 본다. */
-    fun insert(d: Deposit): Boolean {
+    /** 같은 알림이 갱신되어 다시 올 때를 대비해 (종류, 금액, 상대, 잔액)이 같고 2분 이내면 중복으로 본다. */
+    fun insert(t: Txn): Boolean {
         val db = writableDatabase
         db.rawQuery(
-            "SELECT 1 FROM deposits WHERE amount=? AND sender=? AND balance=? AND ts BETWEEN ? AND ? LIMIT 1",
+            "SELECT 1 FROM deposits WHERE kind=? AND amount=? AND sender=? AND balance=? AND ts BETWEEN ? AND ? LIMIT 1",
             arrayOf(
-                d.amount.toString(), d.sender, d.balance.toString(),
-                (d.ts - 120_000).toString(), (d.ts + 120_000).toString()
+                t.kind, t.amount.toString(), t.party, t.balance.toString(),
+                (t.ts - 120_000).toString(), (t.ts + 120_000).toString()
             )
         ).use { if (it.moveToFirst()) return false }
         val cv = ContentValues().apply {
-            put("ts", d.ts); put("amount", d.amount); put("sender", d.sender)
-            put("account", d.account); put("balance", d.balance)
+            put("ts", t.ts); put("kind", t.kind); put("amount", t.amount); put("sender", t.party)
+            put("account", t.account); put("balance", t.balance); put("raw", t.raw)
         }
         return db.insert("deposits", null, cv) != -1L
     }
 
-    fun between(from: Long, to: Long, limit: Int = -1): List<Deposit> {
-        val out = ArrayList<Deposit>()
-        val sql = "SELECT id,ts,amount,sender,account,balance FROM deposits WHERE ts>=? AND ts<? ORDER BY ts DESC" +
+    private val cols = "id,ts,kind,amount,sender,account,balance,raw"
+
+    private fun android.database.Cursor.toTxn() = Txn(
+        getLong(0), getLong(1), getString(2), getLong(3), getString(4), getString(5), getLong(6), getString(7)
+    )
+
+    fun between(from: Long, to: Long, limit: Int = -1): List<Txn> {
+        val out = ArrayList<Txn>()
+        val sql = "SELECT $cols FROM deposits WHERE ts>=? AND ts<? ORDER BY ts DESC" +
             if (limit > 0) " LIMIT $limit" else ""
         readableDatabase.rawQuery(sql, arrayOf(from.toString(), to.toString())).use { c ->
-            while (c.moveToNext()) {
-                out.add(Deposit(c.getLong(0), c.getLong(1), c.getLong(2), c.getString(3), c.getString(4), c.getLong(5)))
-            }
+            while (c.moveToNext()) out.add(c.toTxn())
         }
         return out
     }
+
+    fun byId(id: Long): Txn? =
+        readableDatabase.rawQuery("SELECT $cols FROM deposits WHERE id=?", arrayOf(id.toString())).use { c ->
+            if (c.moveToFirst()) c.toTxn() else null
+        }
 
     fun delete(id: Long) {
         writableDatabase.delete("deposits", "id=?", arrayOf(id.toString()))
@@ -124,22 +168,27 @@ class Prefs(ctx: Context) {
     var monthly: Boolean
         get() = b("monthly", true)
         set(v) = sp.edit().putBoolean("monthly", v).apply()
-    // 발송 시각: 하루 중 분 단위 (기본 00:10). 요일은 java.time.DayOfWeek 값(월=1..일=7)
+
+    // 발송 시각: 하루 중 분 단위 (기본 23:55). 요일은 DayOfWeek 값(월=1..일=7), 월간 일자 0=말일
     var dailyMin: Int
-        get() = sp.getInt("dailyMin", 10)
+        get() = sp.getInt("dailyMin", 23 * 60 + 55)
         set(v) = sp.edit().putInt("dailyMin", v).apply()
     var weeklyMin: Int
-        get() = sp.getInt("weeklyMin", 10)
+        get() = sp.getInt("weeklyMin", 23 * 60 + 55)
         set(v) = sp.edit().putInt("weeklyMin", v).apply()
     var weeklyDow: Int
-        get() = sp.getInt("weeklyDow", 1)
+        get() = sp.getInt("weeklyDow", 7)
         set(v) = sp.edit().putInt("weeklyDow", v).apply()
     var monthlyMin: Int
-        get() = sp.getInt("monthlyMin", 10)
+        get() = sp.getInt("monthlyMin", 23 * 60 + 55)
         set(v) = sp.edit().putInt("monthlyMin", v).apply()
     var monthlyDay: Int
-        get() = sp.getInt("monthlyDay", 1)
+        get() = sp.getInt("monthlyDay", 0)
         set(v) = sp.edit().putInt("monthlyDay", v).apply()
+    var schedVer: Int
+        get() = sp.getInt("schedVer", 0)
+        set(v) = sp.edit().putInt("schedVer", v).apply()
+
     var lastDaily: String
         get() = s("lastDaily")
         set(v) = sp.edit().putString("lastDaily", v).apply()
@@ -156,13 +205,17 @@ class Prefs(ctx: Context) {
 object Fmt {
     private val nf = NumberFormat.getNumberInstance(Locale.KOREA)
     private val dtf = DateTimeFormatter.ofPattern("M/d(E) HH:mm", Locale.KOREAN)
+    private val fullf = DateTimeFormatter.ofPattern("yyyy-MM-dd(E) HH:mm:ss", Locale.KOREAN)
     private val df = DateTimeFormatter.ofPattern("yyyy-MM-dd(E)", Locale.KOREAN)
     private val dayf = DateTimeFormatter.ofPattern("M/d(E)", Locale.KOREAN)
     private val timef = DateTimeFormatter.ofPattern("HH:mm", Locale.KOREAN)
     private val zone: ZoneId get() = ZoneId.systemDefault()
 
     fun won(n: Long): String = nf.format(n) + "원"
+    fun signed(n: Long): String = if (n >= 0) "+${won(n)}" else "-${won(-n)}"
+    fun amount(t: Txn): String = (if (t.isDeposit) "+" else "-") + won(t.amount)
     fun dt(ts: Long): String = dtf.format(Instant.ofEpochMilli(ts).atZone(zone))
+    fun full(ts: Long): String = fullf.format(Instant.ofEpochMilli(ts).atZone(zone))
     fun time(ts: Long): String = timef.format(Instant.ofEpochMilli(ts).atZone(zone))
     fun date(d: LocalDate): String = df.format(d)
     fun day(ts: Long): LocalDate = Instant.ofEpochMilli(ts).atZone(zone).toLocalDate()

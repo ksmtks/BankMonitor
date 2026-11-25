@@ -3,11 +3,12 @@ package com.ksmtks.bankmonitor
 import android.app.Activity
 import android.app.AlarmManager
 import android.app.AlertDialog
+import android.app.DatePickerDialog
 import android.app.TimePickerDialog
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
-import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
@@ -25,34 +26,24 @@ import android.widget.ListView
 import android.widget.ScrollView
 import android.widget.Switch
 import android.widget.TextView
-import android.widget.Toast
 import java.time.LocalDate
-
-private val INK = Color.parseColor("#191919")
-private val SUB = Color.parseColor("#8B8F99")
-private val BG = Color.parseColor("#F4F5F7")
-private val YEL = Color.parseColor("#FEE500")
-private val YEL_D = Color.parseColor("#FFC800")
-private val BLUE = Color.parseColor("#2F6BFF")
-private val PILL = Color.parseColor("#F0F1F4")
-private val WHITE = Color.WHITE
 
 class MainActivity : Activity() {
     private lateinit var prefs: Prefs
     private lateinit var pages: List<View>
     private lateinit var navTabs: List<LinearLayout>
-    private var currentPage = 0
 
     // 내역
     private sealed class Row {
-        data class Head(val date: LocalDate, val total: Long) : Row()
-        data class Item(val d: Deposit) : Row()
+        data class Head(val date: LocalDate, val dSum: Long, val wSum: Long) : Row()
+        data class Item(val t: Txn) : Row()
     }
 
     private val rows = ArrayList<Row>()
     private lateinit var historyAdapter: BaseAdapter
     private lateinit var hdMonth: TextView
     private lateinit var hdSub: TextView
+    private lateinit var hdSub2: TextView
 
     // 보고서
     private var period = Period.DAY
@@ -66,60 +57,6 @@ class MainActivity : Activity() {
     private lateinit var etChat: EditText
     private lateinit var permStatus: TextView
     private lateinit var exactBtn: TextView
-
-    private fun dp(n: Int) = (n * resources.displayMetrics.density).toInt()
-
-    // ───────── UI helpers ─────────
-    private fun round(color: Int, r: Int, stroke: Int = 0) = GradientDrawable().apply {
-        setColor(color)
-        cornerRadius = dp(r).toFloat()
-        if (stroke != 0) setStroke(dp(1), stroke)
-    }
-
-    private fun tv(text: String, size: Float, color: Int = INK, bold: Boolean = false) = TextView(this).apply {
-        this.text = text
-        textSize = size
-        setTextColor(color)
-        if (bold) setTypeface(null, Typeface.BOLD)
-    }
-
-    private fun vbox() = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-    private fun hbox() = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL }
-
-    private fun card() = vbox().apply {
-        setPadding(dp(18), dp(16), dp(18), dp(16))
-        background = round(WHITE, 20)
-    }
-
-    private fun cardLp() = LinearLayout.LayoutParams(-1, -2).apply { setMargins(dp(16), dp(6), dp(16), dp(6)) }
-
-    private fun pill(text: String) = tv(text, 14f, INK, true).apply {
-        setPadding(dp(14), dp(8), dp(14), dp(8))
-        background = round(PILL, 18)
-    }
-
-    private fun button(text: String, filled: Boolean) = tv(text, 15f, INK, true).apply {
-        gravity = Gravity.CENTER
-        setPadding(dp(16), dp(14), dp(16), dp(14))
-        background = if (filled) round(YEL, 16) else round(WHITE, 16, Color.parseColor("#D9DCE2"))
-    }
-
-    private fun field(hint: String, value: String, secret: Boolean) = EditText(this).apply {
-        this.hint = hint
-        setText(value)
-        textSize = 15f
-        setSingleLine()
-        setTextColor(INK)
-        setHintTextColor(SUB)
-        setPadding(dp(14), dp(12), dp(14), dp(12))
-        background = round(BG, 12)
-        inputType = InputType.TYPE_CLASS_TEXT or
-            (if (secret) InputType.TYPE_TEXT_VARIATION_PASSWORD else InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
-    }
-
-    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_LONG).show()
-
-    private fun pageTitle(t: String) = tv(t, 24f, INK, true).apply { setPadding(dp(20), dp(20), dp(20), dp(8)) }
 
     // ───────── lifecycle ─────────
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -164,16 +101,23 @@ class MainActivity : Activity() {
     }
 
     private fun show(i: Int) {
-        currentPage = i
         pages.forEachIndexed { idx, v -> v.visibility = if (idx == i) View.VISIBLE else View.GONE }
         navTabs.forEachIndexed { idx, t ->
             val sel = idx == i
-            (t.findViewWithTag<TextView>("icon")).alpha = if (sel) 1f else 0.35f
-            (t.findViewWithTag<TextView>("label")).setTextColor(if (sel) INK else SUB)
+            t.findViewWithTag<TextView>("icon").alpha = if (sel) 1f else 0.35f
+            t.findViewWithTag<TextView>("label").setTextColor(if (sel) INK else SUB)
         }
         if (i == 0) refreshHistory()
         if (i == 1) refreshReport()
         if (i == 2) refreshPerm()
+    }
+
+    private fun openDay(d: LocalDate) {
+        startActivity(Intent(this, DayActivity::class.java).putExtra("day", d.toEpochDay()))
+    }
+
+    private fun openDetail(t: Txn) {
+        startActivity(Intent(this, DetailActivity::class.java).putExtra("id", t.id))
     }
 
     // ───────── 내역 ─────────
@@ -193,6 +137,8 @@ class MainActivity : Activity() {
         head.addView(hdMonth)
         hdSub = tv("", 13f, Color.parseColor("#4A4200")).apply { setPadding(0, dp(4), 0, 0) }
         head.addView(hdSub)
+        hdSub2 = tv("", 13f, Color.parseColor("#4A4200")).apply { setPadding(0, dp(2), 0, 0) }
+        head.addView(hdSub2)
         root.addView(head, LinearLayout.LayoutParams(-1, -2))
 
         historyAdapter = object : BaseAdapter() {
@@ -201,27 +147,32 @@ class MainActivity : Activity() {
             override fun getItemId(position: Int) = position.toLong()
             override fun getViewTypeCount() = 2
             override fun getItemViewType(position: Int) = if (rows[position] is Row.Head) 0 else 1
-            override fun isEnabled(position: Int) = rows[position] is Row.Item
             override fun getView(position: Int, convertView: View?, parent: ViewGroup?): View =
                 when (val r = rows[position]) {
                     is Row.Head -> headView(r)
-                    is Row.Item -> itemView(r.d)
+                    is Row.Item -> txnRow(r.t)
                 }
         }
         val list = ListView(this).apply {
             adapter = historyAdapter
             divider = null
             dividerHeight = 0
-            selector = android.graphics.drawable.ColorDrawable(Color.TRANSPARENT)
+            selector = ColorDrawable(Color.TRANSPARENT)
             setPadding(0, dp(8), 0, dp(16))
             clipToPadding = false
+            setOnItemClickListener { _, _, pos, _ ->
+                when (val r = rows[pos]) {
+                    is Row.Head -> openDay(r.date)
+                    is Row.Item -> openDetail(r.t)
+                }
+            }
             setOnItemLongClickListener { _, _, pos, _ ->
                 val r = rows[pos]
                 if (r is Row.Item) {
                     AlertDialog.Builder(this@MainActivity)
-                        .setMessage("${r.d.sender} ${Fmt.won(r.d.amount)} 내역을 삭제할까요?")
+                        .setMessage("${r.t.party} ${Fmt.amount(r.t)} 내역을 삭제할까요?")
                         .setPositiveButton("삭제") { _, _ ->
-                            Db.get(this@MainActivity).delete(r.d.id)
+                            Db.get(this@MainActivity).delete(r.t.id)
                             refreshHistory(); refreshReport()
                         }
                         .setNegativeButton("취소", null)
@@ -230,7 +181,7 @@ class MainActivity : Activity() {
                 true
             }
         }
-        val empty = tv("아직 입금 내역이 없어요\n설정에서 알림 접근을 허용하면\n입금 알림이 자동으로 쌓여요", 14f, SUB).apply {
+        val empty = tv("아직 거래 내역이 없어요\n설정에서 알림 접근을 허용하면\n입출금 알림이 자동으로 쌓여요", 14f, SUB).apply {
             gravity = Gravity.CENTER
             setLineSpacing(0f, 1.3f)
         }
@@ -250,62 +201,47 @@ class MainActivity : Activity() {
             else -> Fmt.dayShort(r.date)
         }
         val row = hbox().apply { setPadding(dp(22), dp(14), dp(22), dp(4)) }
-        row.addView(tv(label, 13f, SUB, true), LinearLayout.LayoutParams(0, -2, 1f))
-        row.addView(tv(Fmt.won(r.total), 13f, SUB, true))
+        row.addView(tv(label, 13f, INK, true), LinearLayout.LayoutParams(0, -2, 1f))
+        row.addView(tv("입금 ${Fmt.won(r.dSum)}", 12f, BLUE, true))
+        row.addView(tv("  출금 ${Fmt.won(r.wSum)}", 12f, RED, true))
+        row.addView(tv("  ›", 13f, SUB, true))
         return row
     }
 
-    private fun itemView(d: Deposit): View {
-        val row = hbox().apply {
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-            background = round(WHITE, 16)
-        }
-        val av = TextView(this).apply {
-            text = d.sender.take(1)
-            gravity = Gravity.CENTER
-            textSize = 16f
-            setTextColor(INK)
-            setTypeface(null, Typeface.BOLD)
-            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(Color.parseColor("#FFF3A6")) }
-        }
-        row.addView(av, LinearLayout.LayoutParams(dp(40), dp(40)))
-        val mid = vbox().apply { setPadding(dp(12), 0, dp(8), 0) }
-        mid.addView(tv(d.sender, 15f, INK, true))
-        mid.addView(tv(Fmt.time(d.ts) + if (d.account.isNotEmpty()) " · ${d.account}" else "", 12f, SUB))
-        row.addView(mid, LinearLayout.LayoutParams(0, -2, 1f))
-        val right = vbox().apply { gravity = Gravity.END }
-        right.addView(tv("+${Fmt.won(d.amount)}", 16f, BLUE, true))
-        if (d.balance >= 0) right.addView(tv("잔액 ${Fmt.won(d.balance)}", 11f, SUB))
-        row.addView(right)
-        return FrameLayout(this).apply {
-            setPadding(dp(16), dp(4), dp(16), dp(4))
-            addView(row, FrameLayout.LayoutParams(-1, -2))
-        }
-    }
-
-    private fun sumOf(p: Period): Pair<Long, Int> {
+    private fun totalsOf(p: Period): Totals {
         val s = Report.startOf(p, LocalDate.now())
-        val l = Db.get(this).between(Fmt.millis(s), Fmt.millis(Report.endExclusive(p, s)))
-        return l.sumOf { it.amount } to l.size
+        return Totals(Db.get(this).between(Fmt.millis(s), Fmt.millis(Report.endExclusive(p, s))))
     }
 
     private fun refreshHistory() {
         if (!::historyAdapter.isInitialized) return
-        val (d, _) = sumOf(Period.DAY)
-        val (w, _) = sumOf(Period.WEEK)
-        val (m, mn) = sumOf(Period.MONTH)
-        hdMonth.text = Fmt.won(m)
-        hdSub.text = "${mn}건  ·  오늘 ${Fmt.won(d)}  ·  이번 주 ${Fmt.won(w)}"
+        val d = totalsOf(Period.DAY)
+        val m = totalsOf(Period.MONTH)
+        hdMonth.text = Fmt.won(m.dSum)
+        hdSub.text = "출금 ${Fmt.won(m.wSum)}  ·  순증감 ${Fmt.signed(m.net)}"
+        hdSub2.text = "오늘 입금 ${Fmt.won(d.dSum)}  ·  출금 ${Fmt.won(d.wSum)}"
         rows.clear()
         val items = Db.get(this).between(0L, Long.MAX_VALUE, 500)
         items.groupBy { Fmt.day(it.ts) }.entries.sortedByDescending { it.key }.forEach { e ->
-            rows.add(Row.Head(e.key, e.value.sumOf { it.amount }))
+            val t = Totals(e.value)
+            rows.add(Row.Head(e.key, t.dSum, t.wSum))
             e.value.forEach { rows.add(Row.Item(it)) }
         }
         historyAdapter.notifyDataSetChanged()
     }
 
     // ───────── 보고서 ─────────
+    private fun pickReportDate() {
+        DatePickerDialog(
+            this, android.R.style.Theme_Material_Light_Dialog_Alert,
+            { _, y, m, d ->
+                reportStart = Report.startOf(period, LocalDate.of(y, m + 1, d))
+                refreshReport()
+            },
+            reportStart.year, reportStart.monthValue - 1, reportStart.dayOfMonth
+        ).show()
+    }
+
     private fun buildReport(): View {
         val root = vbox()
         root.addView(pageTitle("보고서"))
@@ -330,45 +266,28 @@ class MainActivity : Activity() {
         root.addView(seg, LinearLayout.LayoutParams(-1, -2).apply { setMargins(dp(16), dp(4), dp(16), dp(8)) })
 
         val nav = hbox()
-        val prev = tv("‹", 30f, INK, true).apply {
+        nav.addView(tv("‹", 30f, INK, true).apply {
             setPadding(dp(20), 0, dp(20), dp(4))
             setOnClickListener { reportStart = Report.shift(period, reportStart, -1); refreshReport() }
+        })
+        reportTitle = tv("", 15f, INK, true).apply {
+            gravity = Gravity.CENTER
+            setPadding(0, dp(8), 0, dp(8))
+            setOnClickListener { pickReportDate() }
         }
-        val next = tv("›", 30f, INK, true).apply {
+        nav.addView(reportTitle, LinearLayout.LayoutParams(0, -2, 1f))
+        nav.addView(tv("›", 30f, INK, true).apply {
             setPadding(dp(20), 0, dp(20), dp(4))
             setOnClickListener { reportStart = Report.shift(period, reportStart, 1); refreshReport() }
-        }
-        reportTitle = tv("", 15f, INK, true).apply { gravity = Gravity.CENTER }
-        nav.addView(prev)
-        nav.addView(reportTitle, LinearLayout.LayoutParams(0, -2, 1f))
-        nav.addView(next)
+        })
         root.addView(nav, LinearLayout.LayoutParams(-1, -2))
 
         reportBox = vbox()
-        val sv = ScrollView(this).apply {
-            isVerticalScrollBarEnabled = false
-            addView(reportBox)
-        }
-        root.addView(sv, LinearLayout.LayoutParams(-1, 0, 1f))
+        root.addView(
+            ScrollView(this).apply { isVerticalScrollBarEnabled = false; addView(reportBox) },
+            LinearLayout.LayoutParams(-1, 0, 1f)
+        )
         return root
-    }
-
-    private fun barRow(label: String, amount: Long, max: Long, sub: String): View {
-        val box = vbox().apply { setPadding(0, dp(8), 0, dp(8)) }
-        val top = hbox()
-        top.addView(tv(label, 14f, INK, true), LinearLayout.LayoutParams(0, -2, 1f))
-        top.addView(tv(Fmt.won(amount), 14f, INK, true))
-        box.addView(top)
-        val track = hbox().apply { background = round(PILL, 4) }
-        val fill = View(this).apply { background = round(YEL_D, 4) }
-        val rest = View(this)
-        val w = amount.coerceAtLeast(1).toFloat()
-        val r = (max - amount).coerceAtLeast(0).toFloat()
-        track.addView(fill, LinearLayout.LayoutParams(0, dp(8), w))
-        track.addView(rest, LinearLayout.LayoutParams(0, dp(8), r))
-        box.addView(track, LinearLayout.LayoutParams(-1, dp(8)).apply { topMargin = dp(6) })
-        box.addView(tv(sub, 11f, SUB).apply { setPadding(0, dp(4), 0, 0) })
-        return box
     }
 
     private fun refreshReport() {
@@ -378,47 +297,52 @@ class MainActivity : Activity() {
             t.background = if (sel) round(WHITE, 10) else null
             t.setTextColor(if (sel) INK else SUB)
         }
-        reportTitle.text = Report.title(period, reportStart)
+        reportTitle.text = Report.title(period, reportStart) + "  ▾"
         val end = Report.endExclusive(period, reportStart)
         val list = Db.get(this).between(Fmt.millis(reportStart), Fmt.millis(end))
+        val t = Totals(list)
         reportBox.removeAllViews()
+        reportBox.addView(totalsCard(list), cardLp())
 
-        val total = list.sumOf { it.amount }
-        val sum = card()
-        sum.addView(tv("총 입금", 13f, SUB, true))
-        sum.addView(tv(Fmt.won(total), 32f, INK, true).apply { setPadding(0, dp(4), 0, dp(2)) })
-        sum.addView(
-            tv(
-                if (list.isEmpty()) "입금 내역이 없어요" else "${list.size}건  ·  건당 평균 ${Fmt.won(total / list.size)}",
-                13f, SUB
-            )
-        )
-        reportBox.addView(sum, cardLp())
-
-        if (list.isNotEmpty()) {
-            val bySender = list.groupBy { it.sender }.entries
-                .sortedByDescending { e -> e.value.sumOf { it.amount } }.take(10)
-            val c1 = card()
-            c1.addView(tv("보낸 사람별", 14f, INK, true))
-            val max1 = bySender.first().value.sumOf { it.amount }
-            bySender.forEach { e -> c1.addView(barRow(e.key, e.value.sumOf { it.amount }, max1, "${e.value.size}건")) }
-            reportBox.addView(c1, cardLp())
+        if (list.isEmpty()) {
+            reportBox.addView(tv("거래 내역이 없어요", 14f, SUB).apply {
+                gravity = Gravity.CENTER
+                setPadding(0, dp(24), 0, dp(24))
+            }, LinearLayout.LayoutParams(-1, -2))
+        } else {
+            fun partyCard(title: String, items: List<Txn>, color: Int) {
+                if (items.isEmpty()) return
+                val g = items.groupBy { it.party }.entries.sortedByDescending { e -> e.value.sumOf { it.amount } }.take(10)
+                val c = card()
+                c.addView(tv(title, 14f, INK, true))
+                val max = g.first().value.sumOf { it.amount }
+                g.forEach { e ->
+                    val sum = e.value.sumOf { it.amount }
+                    c.addView(barRow(e.key, Fmt.won(sum), sum, max, "${e.value.size}건", color))
+                }
+                reportBox.addView(c, cardLp())
+            }
+            partyCard("입금 - 보낸 사람별", t.deposits, BLUE)
+            partyCard("출금 - 받는 사람별", t.withdrawals, RED)
 
             val c2 = card()
             if (period == Period.DAY) {
-                c2.addView(tv("입금 내역", 14f, INK, true))
-                list.sortedBy { it.ts }.forEach { d ->
-                    val r = hbox().apply { setPadding(0, dp(8), 0, dp(8)) }
-                    r.addView(tv(Fmt.time(d.ts), 13f, SUB), LinearLayout.LayoutParams(dp(56), -2))
-                    r.addView(tv(d.sender, 14f, INK, true), LinearLayout.LayoutParams(0, -2, 1f))
-                    r.addView(tv("+${Fmt.won(d.amount)}", 14f, BLUE, true))
-                    c2.addView(r)
-                }
+                c2.addView(tv("상세 내역 (눌러서 자세히 보기)", 14f, INK, true))
+                list.forEach { x -> c2.addView(txnRow(x) { openDetail(x) }.apply { setPadding(0, dp(4), 0, dp(4)) }) }
             } else {
-                c2.addView(tv("일별", 14f, INK, true))
+                c2.addView(tv("일별 (눌러서 그날 보기)", 14f, INK, true))
                 val byDay = list.groupBy { Fmt.day(it.ts) }.toSortedMap()
-                val max2 = byDay.values.maxOf { v -> v.sumOf { it.amount } }
-                byDay.forEach { (d, ds) -> c2.addView(barRow(Fmt.dayShort(d), ds.sumOf { it.amount }, max2, "${ds.size}건")) }
+                val max2 = byDay.values.maxOf { v -> Totals(v).let { it.dSum + it.wSum } }
+                byDay.forEach { (d, ds) ->
+                    val dt = Totals(ds)
+                    c2.addView(
+                        barRow(
+                            Fmt.dayShort(d), Fmt.signed(dt.net), dt.dSum + dt.wSum, max2,
+                            "입금 ${Fmt.won(dt.dSum)} · 출금 ${Fmt.won(dt.wSum)} · ${ds.size}건",
+                            YEL_D
+                        ) { openDay(d) }
+                    )
+                }
             }
             reportBox.addView(c2, cardLp())
         }
@@ -440,6 +364,7 @@ class MainActivity : Activity() {
     // ───────── 설정 ─────────
     private fun fmtMin(m: Int) = "%02d:%02d".format(m / 60, m % 60)
     private val dowNames = arrayOf("월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일")
+    private fun dayLabel(d: Int) = if (d <= 0) "말일" else "${d}일"
 
     private fun applySchedule() {
         Scheduler.resetKeys(this)
@@ -467,7 +392,18 @@ class MainActivity : Activity() {
         setOnCheckedChangeListener { _, c -> onChange(c) }
     }
 
-    private fun divider() = View(this).apply { setBackgroundColor(Color.parseColor("#EEF0F3")) }
+    private fun field(hint: String, value: String, secret: Boolean) = EditText(this).apply {
+        this.hint = hint
+        setText(value)
+        textSize = 15f
+        setSingleLine()
+        setTextColor(INK)
+        setHintTextColor(SUB)
+        setPadding(dp(14), dp(12), dp(14), dp(12))
+        background = round(BG, 12)
+        inputType = InputType.TYPE_CLASS_TEXT or
+            (if (secret) InputType.TYPE_TEXT_VARIATION_PASSWORD else InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS)
+    }
 
     private fun buildSettings(): View {
         val box = vbox().apply { setPadding(0, 0, 0, dp(24)) }
@@ -505,7 +441,7 @@ class MainActivity : Activity() {
         // 알림
         val c2 = card()
         c2.addView(tv("알림", 14f, INK, true))
-        c2.addView(settingRow("입금 즉시 알림", sw(prefs.instant) { prefs.instant = it }).apply { setPadding(0, dp(10), 0, dp(6)) })
+        c2.addView(settingRow("입출금 즉시 알림", sw(prefs.instant) { prefs.instant = it }).apply { setPadding(0, dp(10), 0, dp(6)) })
         c2.addView(divider(), LinearLayout.LayoutParams(-1, dp(1)).apply { setMargins(0, dp(6), 0, dp(6)) })
 
         // 일간
@@ -529,12 +465,12 @@ class MainActivity : Activity() {
 
         // 월간
         c2.addView(divider(), LinearLayout.LayoutParams(-1, dp(1)).apply { setMargins(0, dp(8), 0, dp(6)) })
-        val mDay = pill("${prefs.monthlyDay}일")
+        val mDay = pill(dayLabel(prefs.monthlyDay))
         val mTime = pill(fmtMin(prefs.monthlyMin))
         mDay.setOnClickListener {
-            val names = Array(28) { "${it + 1}일" }
+            val names = Array(29) { dayLabel(if (it == 0) 0 else it) }
             AlertDialog.Builder(this).setItems(names) { _, which ->
-                prefs.monthlyDay = which + 1; mDay.text = names[which]; applySchedule()
+                prefs.monthlyDay = which; mDay.text = names[which]; applySchedule()
             }.show()
         }
         mTime.setOnClickListener { pickTime(prefs.monthlyMin) { prefs.monthlyMin = it; mTime.text = fmtMin(it); applySchedule() } }
@@ -543,9 +479,9 @@ class MainActivity : Activity() {
 
         c2.addView(
             tv(
-                "발송 시각이 낮 12시 이후면 그날까지, 12시 전이면 전날까지 집계해요.\n" +
-                    "예) 일간 00:10 → 전날 보고, 일간 22:00 → 당일 보고.\n" +
-                    "주간은 월~일 기준이고 지정한 시점까지의 내역을 보내요.",
+                "집계는 항상 발송일 당일 기준이에요.\n" +
+                    "일간 = 그날, 주간 = 그 주 월요일~발송일, 월간 = 그 달 1일~발송일.\n" +
+                    "(기본: 매일 23:55 / 일요일 23:55 / 말일 23:55)",
                 12f, SUB
             ).apply { setPadding(0, dp(12), 0, 0); setLineSpacing(0f, 1.2f) }
         )
@@ -590,8 +526,7 @@ class MainActivity : Activity() {
     private fun refreshPerm() {
         if (!::permStatus.isInitialized) return
         val enabled = Settings.Secure.getString(contentResolver, "enabled_notification_listeners").orEmpty()
-        val on = enabled.contains(packageName)
-        permStatus.text = if (on) "✅ 허용됨" else "⚠️ 허용되지 않음 (입금 알림을 읽을 수 없어요)"
+        permStatus.text = if (enabled.contains(packageName)) "✅ 허용됨" else "⚠️ 허용되지 않음 (알림을 읽을 수 없어요)"
         val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
         val needExact = Build.VERSION.SDK_INT >= 31 && !am.canScheduleExactAlarms()
         exactBtn.visibility = if (needExact) View.VISIBLE else View.GONE
